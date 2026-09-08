@@ -13,7 +13,7 @@ agent = Agent(
     name='triage',
     instructions="""
 You triage one GitHub issue. Read the issue in the prompt, then post exactly one
-comment with the `add_comment` tool. The comment has three parts, in order:
+comment with the `safeoutputs_add_comment` tool. The comment has three parts, in order:
 
 1. **Summary.** What the issue reports, in two sentences or fewer.
 2. **Suggested label.** One label from `label_catalog()`, and one line saying why.
