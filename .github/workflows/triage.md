@@ -2,15 +2,11 @@
 on:
   issues:
     types: [opened]
-  workflow_dispatch:
 permissions:
   contents: read
   issues: read
 imports:
-  # Becomes `pydantic/pydantic-ai-harness/gh-aw/pydantic.md@main` once the engine
-  # definition lands on main. Pin a commit SHA, or a release tag cut after that,
-  # to freeze it.
-  - pydantic/pydantic-ai-harness/gh-aw/pydantic.md@add-gh-aw-engine-definition
+  - pydantic/pydantic-ai-harness/gh-aw/pydantic.md@main
 engine:
   id: pydantic-ai
   model: openai/gpt-5
