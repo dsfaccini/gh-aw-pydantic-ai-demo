@@ -12,7 +12,10 @@ pre-agent-steps:
       #
       # 2.36.0 is the first pydantic-ai-slim release carrying `pai --mcp-config`,
       # which is how the gateway's MCP servers reach the agent.
-      python3 -P -m pip install --quiet --user --disable-pip-version-check "pydantic-ai-harness[cli]==$GH_AW_ENGINE_VERSION" "pydantic-ai-slim[openai,mcp]>=2.36.0"
+      #
+      # The anthropic extra is what an `anthropic/` model runs on: that backend of
+      # the api-proxy serves the Messages API, not Chat Completions.
+      python3 -P -m pip install --quiet --user --disable-pip-version-check "pydantic-ai-harness[cli]==$GH_AW_ENGINE_VERSION" "pydantic-ai-slim[anthropic,openai,mcp]>=2.36.0"
       "$HOME/.local/bin/pai" --version
       python3 -P -c "from pydantic_ai_harness import Coder"
 engine:
@@ -58,7 +61,11 @@ engine:
       const { join } = require("path");
       const { fetchAWFReflect, resolveProviderEndpointFromReflect, deriveBaseUrlFromModelsURL } = require("./awf_reflect.cjs");
 
-      const [command, ...commandArgs] = process.argv.slice(2);
+      // gh-aw passes `execution.command-name` (or a workflow's `engine.command`)
+      // first, then `execution.args`. The name is not spawned -- the CLI is started
+      // by the interpreter that owns the install, see LAUNCHER below -- so only the
+      // arguments after it are forwarded.
+      const commandArgs = process.argv.slice(3);
       const log = message => process.stderr.write(`[pydantic-ai] ${message}\n`);
 
       // `pai -a` takes one target, either an import path or a JSON/YAML agent
@@ -79,7 +86,53 @@ engine:
       agent = Agent(name="coder", capabilities=[Coder()])
       `;
       const DEFAULT_AGENT = "gh_aw_agent:agent";
-      const SPEC_SUFFIXES = [".yml", ".yaml", ".json"];
+
+      // The CLI runs inside the interpreter that owns the install rather than as a
+      // separate `pai` process, so the agent module is imported once, in the process
+      // that runs it. Three things follow from that.
+      //
+      // `pai` reduces any failed `-a` load to one line naming the target, so an
+      // agent that raises on import would reach the step log without its traceback.
+      // The import here happens before the CLI starts, and an unhandled exception is
+      // the step's failure, traceback included.
+      //
+      // `pydantic_ai._cli.load_agent` prepends the working directory -- the checkout
+      // -- to sys.path before resolving the target, ahead of PYTHONPATH. A
+      // repository file named `gh_aw_agent.py` would therefore be loaded in place of
+      // the generated module. Importing the target first settles which file the name
+      // means, because an import of a module already in sys.modules does not search
+      // the path again.
+      //
+      // A separate preflight process could do neither: it would import the module in
+      // one interpreter and leave the CLI to import it again in another, running any
+      // module-level work in the agent twice.
+      //
+      // The residual is `load_agent`'s insert itself: everything the agent imports
+      // after that point still sees the checkout first on sys.path. That is the
+      // CLI's documented behavior for its own users, and not something this file
+      // can change from the outside.
+      //
+      // `-P` keeps the `-c` invocation from putting the working directory on
+      // sys.path on its own account; PYTHONPATH below is what makes the agent
+      // importable. A spec file, and the dotted `module.attribute` form the CLI also
+      // accepts, are left to the CLI as before.
+      const LAUNCHER = `import runpy
+      import sys
+
+      target, *cli_args = sys.argv[1:]
+      module, separator, attribute = target.rpartition(":")
+      if separator and not target.lower().endswith((".yml", ".yaml", ".json")):
+          import importlib
+
+          from pydantic_ai import Agent
+
+          loaded = getattr(importlib.import_module(module), attribute)
+          if not isinstance(loaded, Agent):
+              raise TypeError(f"{target} is {type(loaded).__name__}, not pydantic_ai.Agent")
+
+      sys.argv = ["pai", *cli_args]
+      runpy.run_module("pydantic_ai", run_name="__main__", alter_sys=True)
+      `;
 
       const main = async () => {
         const workspace = process.env.GITHUB_WORKSPACE;
@@ -131,24 +184,54 @@ engine:
         delete env.COPILOT_GITHUB_TOKEN;
 
         const provider = process.env.GH_AW_LLM_PROVIDER;
+        const configuredBaseUrl = process.env.PAI_BASE_URL;
+
+        // `pai` sends the model name verbatim, minus the provider marker that
+        // selects one of its clients, so the bare model ID reaches the api-proxy —
+        // which steers to the configured provider by the port it is reached on, not
+        // by a prefix in the model name: Copilot rejects `copilot/<model>` with
+        // `model_not_supported`.
+        // Only the first segment is the provider. Stripping greedily would eat an
+        // org namespace out of ids like `meta-llama/Llama-3.1`, so this mirrors the
+        // `SplitN(model, "/", 2)` gh-aw itself uses to read the provider off.
+        if (!env.PAI_MODEL) throw new Error("PAI_MODEL is required");
+        const modelProvider = env.PAI_MODEL.split("/", 1)[0].trim().toLowerCase();
+        const requestedModel = env.PAI_MODEL.replace(/^[^/]*\//, "");
+        // The api-proxy's Anthropic backend forwards the request path to
+        // api.anthropic.com unchanged and rewrites Messages-shaped bodies; it does
+        // not translate Chat Completions into Messages. So `anthropic/` is addressed
+        // with the Messages API: `anthropic:` on `-m`, and ANTHROPIC_BASE_URL for
+        // the endpoint. The Copilot and Codex backends are OpenAI-shaped and stay on
+        // Chat Completions, and `PAI_BASE_URL` names a Chat Completions endpoint by
+        // definition, so it keeps every provider there too.
+        const useMessagesAPI = !configuredBaseUrl && modelProvider === "anthropic";
+        // The dotted-alias rewrite describes the api-proxy's Copilot backend,
+        // which publishes Copilot's Claude models under dotted IDs. Every other
+        // destination — the anthropic and openai backends, or an endpoint named
+        // by PAI_BASE_URL — gets the id the workflow wrote: a model actually
+        // called `claude-sonnet-4-5` there has to arrive as that.
+        const model = !configuredBaseUrl && modelProvider === "copilot"
+          ? requestedModel.replace(/^(claude-(?:haiku|sonnet|opus)-\d+)-(\d+)$/, "$1.$2")
+          : requestedModel;
+
         // `PAI_BASE_URL` points the engine at an OpenAI-compatible endpoint of the
         // workflow's choosing instead of the AWF api-proxy. Two constraints shape
         // it.
         //
-        // It has to be a variable of this definition's own, because AWF sets
-        // OPENAI_BASE_URL on this step itself (to the api-proxy on
-        // host.docker.internal) whenever the firewall is enabled, so its presence
+        // It has to be a variable of this definition's own, because AWF sets the
+        // backend's own base URL variable on this step itself (OPENAI_BASE_URL, or
+        // ANTHROPIC_BASE_URL for the anthropic backend), pointing at the api-proxy
+        // on host.docker.internal whenever the firewall is enabled, so its presence
         // cannot carry the workflow's intent, and reading it as intent is what
         // made the pre-#52843 definition pick the wrong endpoint.
         //
         // There is deliberately no matching key knob. gh-aw excludes any
         // `engine.env` value holding a secret from the agent sandbox
         // (`awf --exclude-env`), so a credential cannot be delivered here at all
-        // and OPENAI_API_KEY below stays the placeholder. The endpoint therefore
+        // and the API key below stays the placeholder. The endpoint therefore
         // has to accept that placeholder, or be fronted by something upstream of
         // the agent that adds the real credential.
-        const configuredBaseUrl = process.env.PAI_BASE_URL;
-        let baseUrl = configuredBaseUrl || process.env.OPENAI_BASE_URL;
+        let baseUrl = configuredBaseUrl || (useMessagesAPI ? process.env.ANTHROPIC_BASE_URL : process.env.OPENAI_BASE_URL);
         if (!configuredBaseUrl) {
           // Only /reflect discovery needs the provider: it selects which of the
           // api-proxy's configured endpoints to use. A caller-supplied base URL
@@ -172,70 +255,37 @@ engine:
             const reflectedEndpoint = result.reflectData.endpoints?.find(
               entry => entry?.configured === true && entry.provider === endpoint.endpointProvider
             );
-            if (typeof reflectedEndpoint?.models_url === "string") {
+            if (!useMessagesAPI && typeof reflectedEndpoint?.models_url === "string") {
               // `endpoint.baseUrl` is the models-listing origin, while the
               // OpenAI-compatible client posts to `<base>/chat/completions`, so the
               // path prefix carried by models_url (`/v1` on some providers) has to
               // come along — and this helper applies the same api-proxy ->
               // host.docker.internal rewrite.
+              //
+              // The Anthropic client keeps the origin instead: it appends
+              // `/v1/messages` itself, so carrying the prefix over would post to
+              // `/v1/v1/messages`.
               baseUrl = deriveBaseUrlFromModelsURL(reflectedEndpoint.models_url);
             }
           }
         }
         if (!baseUrl) {
-          throw new Error("Pydantic AI requires AWF endpoint discovery, PAI_BASE_URL or OPENAI_BASE_URL");
-        }
-        env.OPENAI_BASE_URL = baseUrl;
-        // The AWF api-proxy injects the real upstream credentials and ignores the
-        // inbound key, but the OpenAI-compatible client refuses to construct
-        // itself without one.
-        env.OPENAI_API_KEY = "awf-copilot-proxy";
-
-        // `pai` reports a failed `-a` load as a single line naming the target and
-        // nothing else, so the target is imported here first: a missing install or
-        // an agent module that raises then surfaces as the real Python traceback
-        // instead of "Could not load agent from".
-        //
-        // Only the `module:variable` form is reproducible this cheaply. A spec
-        // file goes through `Agent.from_file`, and `pai` also accepts a dotted
-        // `module.attribute` path; both are left to the CLI rather than
-        // reimplemented here, so those keep the terse message.
-        const separator = agentTarget.lastIndexOf(":");
-        const isSpecFile = SPEC_SUFFIXES.some(suffix => agentTarget.toLowerCase().endsWith(suffix));
-        if (!isSpecFile && separator > 0) {
-          const [module, attribute] = [agentTarget.slice(0, separator), agentTarget.slice(separator + 1)];
-          const preflight = spawnSync(
-            python,
-            ["-c", `import ${module} as _agent_module; from pydantic_ai import Agent; assert isinstance(_agent_module.${attribute}, Agent)`],
-            { cwd: workspace, env, encoding: "utf8" }
+          throw new Error(
+            `Pydantic AI requires AWF endpoint discovery, PAI_BASE_URL or ${useMessagesAPI ? "ANTHROPIC_BASE_URL" : "OPENAI_BASE_URL"}`
           );
-          if (preflight.error) throw preflight.error;
-          if (preflight.status !== 0) {
-            throw new Error(
-              `Could not load the Pydantic AI agent ${agentTarget} with ${python}:\n${preflight.stderr || preflight.stdout || `it exited with code ${preflight.status ?? "unknown"}`}`
-            );
-          }
+        }
+        // The AWF api-proxy injects the real upstream credentials and ignores the
+        // inbound key, but neither client constructs itself without one. Setting it
+        // also replaces whatever key this step inherited, so the agent process holds
+        // the placeholder rather than a provider credential.
+        if (useMessagesAPI) {
+          env.ANTHROPIC_BASE_URL = baseUrl;
+          env.ANTHROPIC_API_KEY = "awf-anthropic-proxy";
+        } else {
+          env.OPENAI_BASE_URL = baseUrl;
+          env.OPENAI_API_KEY = "awf-copilot-proxy";
         }
 
-        // `pai` sends the model name verbatim, minus the `openai-chat:` provider
-        // marker that selects its OpenAI-compatible client, so the bare model ID
-        // reaches the api-proxy — which steers to the configured provider by the
-        // port it is reached on, not by a prefix in the model name: Copilot
-        // rejects `copilot/<model>` with `model_not_supported`.
-        // Only the first segment is the provider. Stripping greedily would eat an
-        // org namespace out of ids like `meta-llama/Llama-3.1`, so this mirrors the
-        // `SplitN(model, "/", 2)` gh-aw itself uses to read the provider off.
-        if (!env.PAI_MODEL) throw new Error("PAI_MODEL is required");
-        const modelProvider = env.PAI_MODEL.split("/", 1)[0].trim().toLowerCase();
-        const requestedModel = env.PAI_MODEL.replace(/^[^/]*\//, "");
-        // The dotted-alias rewrite describes the api-proxy's Copilot backend,
-        // which publishes Copilot's Claude models under dotted IDs. Every other
-        // destination — the anthropic and openai backends, or an endpoint named
-        // by PAI_BASE_URL — gets the id the workflow wrote: a model actually
-        // called `claude-sonnet-4-5` there has to arrive as that.
-        const model = !configuredBaseUrl && modelProvider === "copilot"
-          ? requestedModel.replace(/^(claude-(?:haiku|sonnet|opus)-\d+)-(\d+)$/, "$1.$2")
-          : requestedModel;
         // `-m` is always passed: the composed agent carries no model, and without
         // the flag `pai` silently falls back to its own `openai:gpt-5` default,
         // billing a model the workflow never asked for. gh-aw validates
@@ -245,18 +295,21 @@ engine:
         // An explicit `-m` also replaces the model a loaded agent declares, so a
         // `PAI_AGENT` agent runs on the workflow's `engine.model` whatever it was
         // constructed with. That is what routes it through the endpoint above.
-        const args = [...commandArgs, "-a", agentTarget];
+        const cliArgs = [...commandArgs, "-a", agentTarget];
         // The config adapter writes this file only for a workflow that configures
         // MCP tools, and `--mcp-config` fails on a path that is not there, so its
         // absence has to mean "no servers" rather than an error.
         const mcpConfig = join(agentDir, "mcp.json");
-        if (existsSync(mcpConfig)) args.push("--mcp-config", mcpConfig);
-        args.push("-m", `openai-chat:${model}`, readFileSync(promptFile, "utf8"));
+        if (existsSync(mcpConfig)) cliArgs.push("--mcp-config", mcpConfig);
+        cliArgs.push("-m", `${useMessagesAPI ? "anthropic" : "openai-chat"}:${model}`, readFileSync(promptFile, "utf8"));
         log(
           `provider=${configuredBaseUrl ? "(PAI_BASE_URL)" : provider} model=${model} baseUrl=${baseUrl}` +
             (configuredAgent ? ` agent=${configuredAgent}` : "")
         );
-        const result = spawnSync(command, args, { cwd: workspace, env, stdio: "inherit" });
+        // The target is passed twice on purpose: once for LAUNCHER, which imports it
+        // and hands the CLI a module already in sys.modules, and once as the `-a`
+        // the CLI parses for itself.
+        const result = spawnSync(python, ["-P", "-c", LAUNCHER, agentTarget, ...cliArgs], { cwd: workspace, env, stdio: "inherit" });
         if (result.error) throw result.error;
         if (result.status !== 0) {
           const error = new Error(`Pydantic AI execution failed with exit code ${result.status ?? "unknown"}`);
@@ -417,9 +470,17 @@ sub-agent, with the harness's own context-management guardrails. `pai -a` accept
 a single target and its JSON agent-spec format cannot name harness capabilities,
 so the harness script writes that composition as a Python module at
 `.pydantic-ai/gh_aw_agent.py`, puts the directory on `PYTHONPATH`, and passes
-`-a gh_aw_agent:agent`. Because `pai` reduces a failed load to a single line
-naming the target, the harness imports the module itself first and fails the step
-with the underlying Python traceback.
+`-a gh_aw_agent:agent`.
+
+The CLI is started by the interpreter that owns the install -- `python -P -c`
+importing the target and then `runpy.run_module("pydantic_ai")` -- rather than as
+a separate `pai` process. The module is imported exactly once, in the process
+that runs it: an agent that raises on import fails the step with its traceback
+rather than the one line `pai` prints for a failed `-a` load, and the CLI's own
+`load_agent`, which prepends the checkout to `sys.path` before resolving the
+target, finds the module already in `sys.modules` instead of a repository file of
+the same name. That insert still applies to everything imported after it, which
+is the CLI's documented behavior for its own users.
 
 `PAI_AGENT` in `engine.env` replaces that target with an agent the repository
 defines, in the same `module:variable` or spec-file form `pai -a` takes. The
@@ -444,22 +505,29 @@ as executables on `PATH`.
 the AWF api-proxy's backends handles the request; `copilot`, `anthropic`,
 `openai` and `codex` are the values gh-aw accepts. Requests are routed through
 that proxy, whose endpoint is discovered from `/reflect` at run time, so the
-first segment is dropped and the rest of the model ID is passed with
-`-m openai-chat:<model>`
-(`openai-chat:` selects the Pydantic AI OpenAI-compatible client and is not part
-of the model name sent upstream). Only the first segment goes, so an ID carrying
-an org namespace such as `openai/meta-llama/Llama-3.1` keeps it. When the provider
-segment is `copilot`, Claude aliases such as `claude-sonnet-4-5` are normalized
-to the dotted model IDs the proxy's Copilot backend exposes, such as
-`claude-sonnet-4.5`; every other destination — the `anthropic` and `openai`
-backends, or a `PAI_BASE_URL` endpoint — receives the ID as written. `-m` is always passed, because a workflow that
-declares no model would otherwise inherit the CLI's own `openai:gpt-5` default
-silently.
+first segment is dropped and the rest of the model ID is passed with `-m`, under
+the marker for the wire API that backend serves: `anthropic:<model>` against
+`ANTHROPIC_BASE_URL` for `anthropic/`, whose backend forwards the path to
+api.anthropic.com unchanged and does not translate Chat Completions into
+Messages, and `openai-chat:<model>` against `OPENAI_BASE_URL` for the rest. The
+marker selects a Pydantic AI client and is not part of the model name sent
+upstream. The two base URLs differ by a segment: the Anthropic client appends
+`/v1/messages` to the endpoint's origin, the OpenAI-compatible client appends
+`/chat/completions` to the `/v1` prefix the reflected `models_url` carries.
+Only the first segment of the model goes, so an ID carrying an org namespace such
+as `openai/meta-llama/Llama-3.1` keeps it. When the provider segment is
+`copilot`, Claude aliases such as `claude-sonnet-4-5` are normalized to the dotted
+model IDs the proxy's Copilot backend exposes, such as `claude-sonnet-4.5`; every
+other destination — the `anthropic` and `openai` backends, or a `PAI_BASE_URL`
+endpoint — receives the ID as written. `-m` is always passed, because a workflow
+that declares no model would otherwise inherit the CLI's own `openai:gpt-5`
+default silently.
 
 Setting `PAI_BASE_URL` in `engine.env` sends requests to that URL instead of the
 proxy, for any endpoint speaking the OpenAI Chat Completions API. `/reflect`
-discovery is skipped and the provider segment of `model` becomes a formality, so
-write `openai/<model-id>` and the bare ID reaches the endpoint. There is no
+discovery is skipped and the provider segment of `model` becomes a formality --
+including `anthropic/`, which stays on Chat Completions under `PAI_BASE_URL` --
+so write `openai/<model-id>` and the bare ID reaches the endpoint. There is no
 matching key setting: gh-aw keeps `engine.env` values holding secrets out of the
 agent sandbox, so the endpoint has to accept the placeholder bearer token or sit
 behind something that adds the real credential. See `README.md` next to this file
@@ -475,6 +543,6 @@ counts only from any JSON lines the run happens to emit.
 
 The CLI and the coder capabilities are installed before the agent runs with
 `pip install --user "pydantic-ai-harness[cli]==<engine version>"
-"pydantic-ai-slim[openai,mcp]>=2.36.0"`, into `~/.local` because the runner tool
-cache holding `uv` is not writable from inside the sandbox.
+"pydantic-ai-slim[anthropic,openai,mcp]>=2.36.0"`, into `~/.local` because the
+runner tool cache holding `uv` is not writable from inside the sandbox.
 -->
