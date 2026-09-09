@@ -12,7 +12,7 @@ imports:
   - pydantic/pydantic-ai-harness/gh-aw/pydantic.md@add-gh-aw-engine-definition
 engine:
   id: pydantic-ai
-  model: openai/gpt-5
+  model: anthropic/claude-sonnet-4-5
   env:
     PAI_AGENT: my_agent:agent
 safe-outputs:
