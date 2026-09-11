@@ -1,7 +1,7 @@
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModelSettings
 
-settings = OpenAIChatModelSettings(openai_reasoning_effort='max')
+settings = OpenAIChatModelSettings(openai_reasoning_effort='xhigh')
 
 agent = Agent(
     name='triage',
