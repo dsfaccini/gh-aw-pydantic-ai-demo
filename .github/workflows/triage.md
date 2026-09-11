@@ -9,7 +9,7 @@ imports:
   - pydantic/pydantic-ai-harness/gh-aw/pydantic.md@main
 engine:
   id: pydantic-ai
-  model: openai/gpt-5
+  model: openai/gpt-5.6-luna
   env:
     PAI_AGENT: my_agent:agent
 safe-outputs:
