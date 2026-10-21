@@ -4,7 +4,7 @@ on:
 permissions:
   contents: read
 imports:
-  - pydantic/pydantic-ai/src/pydantic_ai_harness/gh-aw/pydantic.md@e8ab544f1f026668089021dc7ee65a63e0c547c2
+  - pydantic/pydantic-ai/src/pydantic_ai_harness/gh-aw/pydantic.md@614f620fec1d3cd85a251ad1d315146a26c7a398
 engine:
   id: pydantic-ai
   model: copilot/claude-haiku-4-5
